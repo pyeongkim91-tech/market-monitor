@@ -290,6 +290,30 @@ def light_change(x, good_when_positive=True, tight=False):
     if mid:  return "🟡"
     return "🟡"
 
+def compute_market_temperature(signals: dict):
+    """🧮 신호등 평균으로 시장온도(MTI) 계산"""
+    score_map = {'🟢': 1, '🟡': 0, '🔴': -1}
+    valid_signals = [score_map.get(v, 0) for v in signals.values() if v in score_map]
+    if not valid_signals:
+        return 0.0, "⚪ 데이터 부족", "신뢰도: 낮음"
+    avg = sum(valid_signals) / len(valid_signals)
+    
+    # 상태 구간 매핑
+    if avg >= 0.6:
+        state, posture = "🔥 과열권", "차익실현/리스크 관리"
+    elif avg >= 0.2:
+        state, posture = "🌤 완만한 강세", "완만한 확대"
+    elif avg <= -0.2:
+        state, posture = "❄️ 냉각기", "방어적 (리스크 축소)"
+    else:
+        state, posture = "⚪ 중립", "중립 (관망)"
+
+    # 신뢰도 표시 (지표 수에 따라)
+    reliability = "신뢰도: 높음" if len(valid_signals) >= 8 else \
+                  "신뢰도: 보통" if len(valid_signals) >= 5 else "신뢰도: 낮음"
+
+    return round(avg, 2), f"{state}", f"{posture} / {reliability}"
+
 # ---------------- 리포트 ----------------
 def build_report(now_utc: datetime):
     ts = now_utc.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
@@ -341,6 +365,15 @@ def build_report(now_utc: datetime):
 
     # 출력
     L=[]
+
+# MTI 계산 및 헤더 표시
+mti, state, posture = compute_market_temperature(signals)
+lines.append(f"Market Temperature: 🌡️ {'▓' * int((mti+1)*5)}{'░' * (10 - int((mti+1)*5))} {int((mti+1)*50)}/100")
+lines.append(f"상태: {state}")
+lines.append(f"포지셔닝: {posture}")
+lines.append("")  # 빈 줄로 구분
+
+
     L.append(f"[Market Monitor] {ts}\n")
     L.append("광범위 지표(200일선 상단 비율):")
     L.append(f"  · S&P500: { _pct(us_ratio) if not np.isnan(us_ratio) else 'N/A' } {light_ratio(us_ratio)}")
@@ -373,7 +406,38 @@ def build_report(now_utc: datetime):
     L.append(f"  · WTI(최근월): { (f'{last(wti):.2f}') if last(wti)==last(wti) else 'N/A' } ({ _pct(wti_c) if wti_c==wti_c else 'N/A' })")
     L.append(f"  · Gold(선물): { (f'{last(gold):.2f}') if last(gold)==last(gold) else 'N/A' } ({ _pct(gold_c) if gold_c==gold_c else 'N/A' })")
 
+# 🟢🟡🔴 결과를 수집 (기존 신호등 텍스트를 그대로 사용 가능)
+signals = {
+    "S&P500": "🟡",
+    "KOSPI200": "🟢",
+    "RSP/VOO": "🟡",
+    "KR Equal": "🟡",
+    "KOSPI": "🟢",
+    "KOSDAQ": "🟡",
+    "VIX": "🟢",
+    # 거시/금리/달러 등도 원하면 포함
+}
+
+
     return "\n".join(L).strip()
+
+import json, os
+
+def update_mti_history(new_value, filename="mti_log.json", max_len=3):
+    hist = []
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
+            hist = json.load(f)
+    hist.append(new_value)
+    hist = hist[-max_len:]
+    with open(filename, "w") as f:
+        json.dump(hist, f)
+    return sum(hist) / len(hist)
+
+# build_report 안에서
+mti_3d = update_mti_history(mti)
+lines.append(f"3일 평균 MTI: {mti_3d:+.2f}")
+
 
 # ---------------- 알림/엔트리 ----------------
 def send_notifications(text: str):
