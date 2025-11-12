@@ -1,0 +1,351 @@
+import os, logging, textwrap
+from io import StringIO
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from pandas_datareader import data as pdr
+import requests
+from bs4 import BeautifulSoup
+
+# ---------- 기본 설정 ----------
+START = "2019-01-01"
+SMA_WIN = 200
+W4 = 20  # 4주(영업일 약 20일)
+
+US_EQW = "RSP"           # Invesco S&P 500 Equal Weight ETF
+US_CAP = "VOO"           # Vanguard S&P 500 ETF
+KR_EQW = "252000.KS"     # KODEX 200 Equal Weighted
+KR_CAP = "069500.KS"     # KODEX 200
+KOSPI  = "^KS11"
+KOSDAQ = "^KQ11"
+VIX    = "^VIX"
+
+logging.basicConfig(level=logging.INFO)
+
+# ---------- 공통 유틸 ----------
+def fred(series_id, start=START):
+    """FRED 시계열(예외 안전). 실패 시 빈 Series."""
+    try:
+        s = pdr.DataReader(series_id, "fred", start=start)
+        if isinstance(s, pd.DataFrame) and s.shape[1] == 1:
+            s = s.iloc[:, 0]
+        return s
+    except Exception as e:
+        logging.exception(f"FRED fetch failed for {series_id}: {e}")
+        return pd.Series(dtype="float64")
+
+def _http_get(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+    }
+    r = requests.get(url, timeout=15, headers=headers)
+    r.raise_for_status()
+    return r.text
+
+def _pick_price(df, tk):
+    """yfinance DataFrame에서 종목 tk의 종가 Series를 안전하게 꺼냄."""
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        if tk in df.columns.get_level_values(0):
+            sub = df[tk]
+            if "Adj Close" in sub and not sub["Adj Close"].dropna().empty:
+                return sub["Adj Close"].rename(tk)
+            if "Close" in sub and not sub["Close"].dropna().empty:
+                return sub["Close"].rename(tk)
+    else:
+        # 일부 버전에서 단일컬럼 프레임일 때 방어
+        for key in ("Adj Close", "Close"):
+            if key in df:
+                col = df[key]
+                if isinstance(col, pd.DataFrame) and tk in col.columns:
+                    s = col[tk].dropna()
+                    if not s.empty:
+                        return s.rename(tk)
+    return None
+
+# ---------- 종목 리스트 ----------
+def get_sp500_tickers():
+    try:
+        html = _http_get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        tables = pd.read_html(html)
+        # constituents 테이블을 우선 찾되, 실패 시 전 테이블 탐색
+        for tb in tables:
+            cols = [c.strip().lower() for c in tb.columns]
+            if "symbol" in cols:
+                syms = tb.iloc[:, cols.index("symbol")].astype(str).str.strip()
+                return [s.replace(".", "-") for s in syms]
+        return []
+    except Exception as e:
+        logging.exception(f"S&P500 ticker fetch failed: {e}")
+        return []
+
+def _to_kr_6dig(x: str) -> str:
+    # 숫자만 추출해 6자리로 맞추고 KRX 접미사
+    digits = "".join([c for c in str(x) if c.isdigit()])
+    if not digits:
+        return ""
+    return f"{int(digits):06d}.KS"
+
+def get_kospi200_tickers():
+    """
+    위키의 테이블 구조 변경에 대비해 모든 테이블을 훑어서
+    'Ticker' / 'Code' / '종목코드' / 'Symbol' 류 컬럼을 찾고,
+    6자리 KRX 코드로 정규화(.KS 붙임).
+    """
+    try:
+        html = _http_get("https://en.wikipedia.org/wiki/KOSPI_200")
+        tables = pd.read_html(html)
+        cands = []
+        for tb in tables:
+            cols = [str(c).strip().lower() for c in tb.columns]
+            for key in ("ticker", "code", "종목코드", "symbol"):
+                if key in cols:
+                    series = tb.iloc[:, cols.index(key)].astype(str).str.strip()
+                    cands.extend(series.tolist())
+        tickers = []
+        for v in cands:
+            tk = _to_kr_6dig(v)
+            if tk:
+                tickers.append(tk)
+        # 고유화 & 상위 200개만
+        tickers = list(dict.fromkeys(tickers))
+        tickers = tickers[:200]
+        return tickers
+    except Exception as e:
+        logging.exception(f"KOSPI200 ticker fetch failed: {e}")
+        return []
+
+# ---------- 브레드스(상승폭확대/축소) ----------
+def breadth_last_series_batched(tickers, start=START, sma_win=SMA_WIN, batch=80):
+    sum_above = None
+    sum_valid = None
+    for i in range(0, len(tickers), batch):
+        chunk = tickers[i:i + batch]
+        try:
+            px = yf.download(chunk, start=start, progress=False,
+                             auto_adjust=False, group_by="ticker", threads=False)
+        except Exception as e:
+            logging.exception(f"yfinance download failed for chunk[{i}:{i+batch}]: {e}")
+            continue
+        # 종가 프레임 만들기
+        if isinstance(px.columns, pd.MultiIndex):
+            cols = []
+            for t in chunk:
+                if t in px.columns.get_level_values(0):
+                    s = None
+                    if "Adj Close" in px[t] and not px[t]["Adj Close"].dropna().empty:
+                        s = px[t]["Adj Close"]
+                    elif "Close" in px[t] and not px[t]["Close"].dropna().empty:
+                        s = px[t]["Close"]
+                    if s is not None:
+                        cols.append(s.rename(t))
+            close = pd.concat(cols, axis=1) if cols else None
+        else:
+            close = None
+            for key in ("Adj Close", "Close"):
+                if key in px:
+                    close = px[key].dropna(how="all")
+                    break
+        if close is None or close.empty:
+            continue
+        sma = close.rolling(sma_win, min_periods=sma_win // 2).mean()
+        last_close = close.iloc[-1]
+        last_sma = sma.iloc[-1]
+        above = (last_close > last_sma).astype("int32")
+        valid = (~pd.isna(last_close)).astype("int32")
+        sum_above = above if sum_above is None else sum_above.add(above, fill_value=0)
+        sum_valid = valid if sum_valid is None else sum_valid.add(valid, fill_value=0)
+    if sum_valid is None or sum_valid.sum() == 0:
+        return pd.Series(dtype="float64")
+    return (sum_above / sum_valid).astype("float64")
+
+# ---------- 지수/ETF 지표 ----------
+def safe_ratio_eqw_cap(eqw=US_EQW, cap=US_CAP, start=START):
+    try:
+        df = yf.download([eqw, cap], start=start, progress=False, group_by="ticker", threads=False)
+        s_eqw = _pick_price(df, eqw)
+        s_cap = _pick_price(df, cap)
+        if s_eqw is None or s_cap is None:
+            return pd.Series(dtype="float64")
+        return (s_eqw / s_cap).dropna()
+    except Exception as e:
+        logging.exception(f"safe_ratio_eqw_cap failed: {e}")
+        return pd.Series(dtype="float64")
+
+def safe_ratio_eqw_cap_korea(eqw=KR_EQW, cap=KR_CAP, start=START):
+    try:
+        df = yf.download([eqw, cap], start=start, progress=False, group_by="ticker", threads=False)
+        s_eqw = _pick_price(df, eqw)
+        s_cap = _pick_price(df, cap)
+        if s_eqw is None or s_cap is None:
+            return pd.Series(dtype="float64")
+        return (s_eqw / s_cap).dropna()
+    except Exception as e:
+        logging.exception(f"safe_ratio_eqw_cap_korea failed: {e}")
+        return pd.Series(dtype="float64")
+
+def get_series_yf(tickers, start=START):
+    """여러 티커를 받아 dict로 Series 반환(없으면 None)."""
+    out = {}
+    try:
+        px = yf.download(tickers, start=start, progress=False, threads=False, group_by="ticker")
+    except Exception as e:
+        logging.exception(f"index download failed: {e}")
+        px = None
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    for tk in tickers:
+        out[tk] = _pick_price(px, tk)
+    return out
+
+# ---------- 포맷 유틸 ----------
+def _pct(x):
+    try:
+        return f"{x*100:.1f}%"
+    except Exception:
+        return "N/A"
+
+def _fmt_last_and_4w(s: pd.Series, unit=""):
+    """시계열 s에서 마지막값과 4주 변화율 문자열."""
+    if s is None or len(s) == 0 or s.dropna().empty:
+        return "N/A"
+    try:
+        last = s.iloc[-1]
+        chg = (s.iloc[-1] / s.iloc[-W4] - 1.0) if len(s) > W4 else np.nan
+        if unit == "%":
+            return f"{last:.2f}% ({_pct(chg) if not np.isnan(chg) else 'N/A'})"
+        elif unit == "bp":
+            # bp는 절대값만 출력
+            return f"{last:.1f}bp"
+        else:
+            return f"{last:.2f} ({_pct(chg) if not np.isnan(chg) else 'N/A'})"
+    except Exception:
+        return "N/A"
+
+# ---------- 리포트 ----------
+def build_report(now_utc: datetime):
+    # 한국시간으로 변환
+    kst = now_utc.astimezone(ZoneInfo("Asia/Seoul"))
+    ts = kst.strftime("%Y-%m-%d %H:%M KST")
+
+    # 1) 광범위 지표
+    spx_members = get_sp500_tickers()
+    kospi200_members = get_kospi200_tickers()
+
+    us_breadth = breadth_last_series_batched(spx_members, start=START, sma_win=SMA_WIN, batch=80) if spx_members else pd.Series(dtype="float64")
+    kr_breadth = breadth_last_series_batched(kospi200_members, start=START, sma_win=SMA_WIN, batch=80) if kospi200_members else pd.Series(dtype="float64")
+
+    us_ratio = (us_breadth.sum() / len(us_breadth)) if len(us_breadth) > 0 else np.nan
+    kr_ratio = (kr_breadth.sum() / len(kr_breadth)) if len(kr_breadth) > 0 else np.nan
+
+    # 2) Equal vs Cap (4주)
+    rsp_voo = safe_ratio_eqw_cap(US_EQW, US_CAP, start=START)
+    kr_eqw_cap = safe_ratio_eqw_cap_korea(KR_EQW, KR_CAP, start=START)
+    rsp_voo_4w = (rsp_voo.iloc[-1] / rsp_voo.iloc[-W4] - 1.0) if len(rsp_voo) > W4 else np.nan
+    kr_eqw_cap_4w = (kr_eqw_cap.iloc[-1] / kr_eqw_cap.iloc[-W4] - 1.0) if len(kr_eqw_cap) > W4 else np.nan
+
+    # 3) 지수/변동성 (4주)
+    idx = get_series_yf([KOSPI, KOSDAQ, VIX], START)
+    ks11 = idx.get(KOSPI); kq11 = idx.get(KOSDAQ); vix = idx.get(VIX)
+    ks_4w = (ks11.iloc[-1] / ks11.iloc[-W4] - 1.0) if ks11 is not None and len(ks11) > W4 else np.nan
+    kq_4w = (kq11.iloc[-1] / kq11.iloc[-W4] - 1.0) if kq11 is not None and len(kq11) > W4 else np.nan
+    vix_4w = (vix.iloc[-1] / vix.iloc[-W4] - 1.0) if vix is not None and len(vix) > W4 else np.nan
+
+    # 4) 거시/경기 신호 (Sahm/T10Y3M/T10Y2Y/HY OAS/BBB OAS)
+    sahm = fred("SAHMCURRENT")                 # Sahm Rule
+    t10y3m = fred("T10Y3M")                    # 10Y-3M
+    t10y2y = fred("T10Y2Y")                    # 10Y-2Y
+    hy_oas = fred("BAMLH0A0HYM2")              # HY OAS (ICE BofA High Yield)
+    bbb_oas= fred("BAMLC0A4CBBB")              # BBB OAS
+
+    # 5) 금리 절대수준, 달러/원, 원자재 (최근값 + 4주변화)
+    dgs10 = fred("DGS10")                      # UST 10Y (%)
+    dgs2  = fred("DGS2")                       # UST 2Y (%)
+    dxy   = fred("DTWEXBGS")                   # Broad Dollar Index (FRED)
+    fx    = get_series_yf("KRW=X", START).get("KRW=X")   # USD/KRW (원/달러)
+    wti   = get_series_yf("CL=F", START).get("CL=F")     # WTI 선물
+    gold  = get_series_yf("GC=F", START).get("GC=F")     # 금 선물
+
+    lines = []
+    lines.append(f"[Market Monitor] {ts}")
+    lines.append("")
+    lines.append("광범위 지표(200일선 상단 비율):")
+    lines.append(f"  · S&P500: { _pct(us_ratio) if not np.isnan(us_ratio) else 'N/A' }")
+    lines.append(f"  · KOSPI200: { _pct(kr_ratio) if not np.isnan(kr_ratio) else 'N/A' }")
+    lines.append("")
+    lines.append("Equal vs Cap (4주 변화):")
+    lines.append(f"  · 미국 RSP/VOO: { _pct(rsp_voo_4w) if not np.isnan(rsp_voo_4w) else 'N/A' }")
+    lines.append(f"  · 한국 KODEX200 Equal Weight / KODEX200 (252000/069500): { _pct(kr_eqw_cap_4w) if not np.isnan(kr_eqw_cap_4w) else 'N/A' }")
+    lines.append("")
+    lines.append("지수/변동성 (4주 변화):")
+    lines.append(f"  · KOSPI: { _pct(ks_4w) if not np.isnan(ks_4w) else 'N/A' }")
+    lines.append(f"  · KOSDAQ: { _pct(kq_4w) if not np.isnan(kq_4w) else 'N/A' }")
+    lines.append(f"  · VIX: { _pct(vix_4w) if not np.isnan(vix_4w) else 'N/A' }")
+    lines.append("")
+    lines.append("거시/경기 신호:")
+    # Sahm gap은 최근치가 양수면 +표기로 표시
+    if sahm is not None and not sahm.dropna().empty:
+        sg = float(sahm.dropna().iloc[-1])
+        lines.append(f"  · Sahm gap: {sg:+.2f}pp  (>= +0.50pp 시 침체 신호)")
+    else:
+        lines.append("  · Sahm gap: N/A")
+    lines.append(f"  · 장단기금리차 T10Y3M: {_fmt_last_and_4w(t10y3m, unit='%')}")
+    lines.append(f"  · 장단기금리차 T10Y2Y: {_fmt_last_and_4w(t10y2y, unit='%')}")
+    lines.append(f"  · HY OAS: {_fmt_last_and_4w(hy_oas, unit='bp')}")
+    lines.append(f"  · BBB OAS: {_fmt_last_and_4w(bbb_oas, unit='bp')}")
+    lines.append("")
+    lines.append("금리·달러·원자재 (최근값, 4주 변화):")
+    lines.append(f"  · UST 10Y: {_fmt_last_and_4w(dgs10, unit='%')}")
+    lines.append(f"  · UST 2Y:  {_fmt_last_and_4w(dgs2,  unit='%')}")
+    lines.append(f"  · 달러지수(무역가중, FRED): {_fmt_last_and_4w(dxy)}")
+    lines.append(f"  · USD/KRW: {_fmt_last_and_4w(fx)}")
+    lines.append(f"  · WTI(최근월): {_fmt_last_and_4w(wti)}")
+    lines.append(f"  · Gold(선물): {_fmt_last_and_4w(gold)}")
+
+    return "\n".join(lines).strip()
+
+# ---------- 알림 ----------
+def send_notifications(text: str):
+    # 이메일
+    try:
+        smtp_host = os.environ.get("SMTP_HOST")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_user = os.environ.get("SMTP_USERNAME")
+        smtp_pass = os.environ.get("SMTP_PASSWORD")
+        email_from = os.environ.get("EMAIL_FROM")
+        to_raw = os.environ.get("EMAIL_TO", "")
+        to_list = [x.strip() for x in to_raw.split(",") if x.strip()]
+        if smtp_host and smtp_user and smtp_pass and email_from and to_list:
+            import smtplib
+            from email.mime.text import MIMEText
+            msg = MIMEText(text, _charset="utf-8")
+            msg["Subject"] = f"[Market Monitor] {datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y-%m-%d %H:%M KST')}"
+            msg["From"] = email_from
+            msg["To"] = ", ".join(to_list)
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
+                s.starttls()
+                s.login(smtp_user, smtp_pass)
+                s.sendmail(email_from, to_list, msg.as_string())
+    except Exception as e:
+        logging.exception(f"Email send failed: {e}")
+
+    # 텔레그램
+    try:
+        bot = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        if bot and chat_id:
+            url = f"https://api.telegram.org/bot{bot}/sendMessage"
+            requests.post(url, data={"chat_id": chat_id, "text": text[:4096]})
+    except Exception as e:
+        logging.exception(f"Telegram send failed: {e}")
+
+# ---------- 엔트리 포인트 ----------
+def run_monitor():
+    text = build_report(datetime.now(timezone.utc))
+    send_notifications(text)
+    return text

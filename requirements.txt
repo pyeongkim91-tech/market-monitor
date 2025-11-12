@@ -1,0 +1,8 @@
+flask
+yfinance
+pandas
+pandas_datareader
+beautifulsoup4
+requests
+lxml
+python-dotenv

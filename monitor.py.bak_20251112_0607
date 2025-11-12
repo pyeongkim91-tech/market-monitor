@@ -1,0 +1,170 @@
+# Market_Monitor_MINFIX.py
+import logging
+from datetime import datetime, timezone, timedelta
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from pandas_datareader import data as pdr
+
+START = "2019-01-01"
+SMA_WIN = 200
+W4 = 20
+
+US_EQW, US_CAP = "RSP", "VOO"
+KR_EQW, KR_CAP = "252000.KS", "069500.KS"
+KOSPI, KOSDAQ, VIX_TK = "^KS11", "^KQ11", "^VIX"
+
+logging.getLogger("yfinance").setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO)
+
+def _pct(x):
+    try: return f"{x*100:.1f}%"
+    except: return "N/A"
+
+def _emoji_zone(val, pos_is_hot=True):
+    if val!=val or np.isnan(val): return "⚪"
+    if pos_is_hot:  # 값↑이 뜨거움
+        return "🔴" if val>0.03 else ("🟡" if val>0 else "🟢")
+    else:          # 값↑이 차가움(예: RSP/VOO, VIX 변화 등)
+        return "🔴" if val<-0.03 else ("🟡" if val<0 else "🟢")
+
+def pct_change_weeks(s: pd.Series, weeks=W4):
+    try:
+        s=s.dropna()
+        if len(s)<=weeks: return np.nan
+        return s.iloc[-1]/s.iloc[-weeks]-1.0
+    except: return np.nan
+
+def yf_series(ticker, start=START):
+    try:
+        df=yf.download(ticker, start=start, progress=False, group_by="ticker",
+                       threads=False, auto_adjust=False)
+        if isinstance(df, pd.Series): return df.dropna()
+        if isinstance(df, pd.DataFrame):
+            s=df.get("Adj Close") if "Adj Close" in df else df.get("Close")
+            if s is None:
+                if "Adj Close" in df.columns or "Close" in df.columns:
+                    key="Adj Close" if "Adj Close" in df.columns else "Close"
+                    return df[key].dropna()
+                return pd.Series(dtype="float64")
+            if isinstance(s, pd.DataFrame): s=s.iloc[:,0]
+            return s.dropna()
+    except: pass
+    return pd.Series(dtype="float64")
+
+def fred(series_id, start=START):
+    try:
+        s=pdr.DataReader(series_id, "fred", start=start)
+        if isinstance(s, pd.DataFrame) and s.shape[1]==1: s=s.iloc[:,0]
+        return s.dropna()
+    except: return pd.Series(dtype="float64")
+
+# --- 대체 브레드스: ETF 자체가 200MA 위인지(0%/100%)
+def proxy_breadth_ratio(etf_ticker):
+    s=yf_series(etf_ticker)
+    if s.empty: return np.nan
+    sma=s.rolling(SMA_WIN, min_periods=SMA_WIN//2).mean()
+    return float(s.iloc[-1] > sma.iloc[-1])
+
+# --- Equal/Cap 비율
+def eqw_cap_ratio(eqw, cap):
+    try:
+        df=yf.download([eqw, cap], start=START, progress=False, group_by="ticker",
+                       threads=False, auto_adjust=False)
+        def pick(df, tk):
+            if isinstance(df.columns, pd.MultiIndex) and tk in df.columns.get_level_values(0):
+                sub=df[tk]; s=sub.get("Adj Close", sub.get("Close", None))
+                return s if s is None else s.rename(tk)
+            for key in ("Adj Close","Close"):
+                if key in df and tk in df[key].columns: return df[key][tk].rename(tk)
+            return None
+        a=pick(df, eqw); b=pick(df, cap)
+        return (a/b).dropna() if a is not None and b is not None else pd.Series(dtype="float64")
+    except: return pd.Series(dtype="float64")
+
+# --- 달러지수: DXY 우선, 실패시 FRED(라벨 변경)
+def get_dollar_index():
+    for tk in ["^DXY", "DX-Y.NYB", "DX=F"]:
+        s=yf_series(tk)
+        if not s.empty:
+            return s, "DXY"
+    # fallback: FRED Broad Dollar Index (레벨 ~120대)
+    s=fred("DTWEXBGS")
+    return (s, "Broad Dollar (FRED)")
+
+def build_report(now_utc: datetime):
+    kst=timezone(timedelta(hours=9))
+    ts=now_utc.astimezone(kst).strftime("%Y-%m-%d %H:%M KST")
+
+    # 1) Breadth(대체 방식: ETF vs 200MA)
+    us_ratio = proxy_breadth_ratio("SPY")   # S&P500 proxy
+    kr_ratio = proxy_breadth_ratio(KR_CAP)  # KOSPI200 proxy
+
+    # 2) Equal vs Cap (4주)
+    rsp_voo = eqw_cap_ratio(US_EQW, US_CAP)
+    kr_eqw_cap = eqw_cap_ratio(KR_EQW, KR_CAP)
+    rsp_voo_4w = (rsp_voo.iloc[-1]/rsp_voo.iloc[-W4]-1) if len(rsp_voo)>W4 else np.nan
+    kr_eqw_cap_4w = (kr_eqw_cap.iloc[-1]/kr_eqw_cap.iloc[-W4]-1) if len(kr_eqw_cap)>W4 else np.nan
+
+    # 3) 지수/변동성 (4주)
+    ks11 = yf_series(KOSPI)
+    kq11 = yf_series(KOSDAQ)
+    vix  = yf_series(VIX_TK) or pd.Series(dtype="float64")
+    ks_4w = pct_change_weeks(ks11)
+    kq_4w = pct_change_weeks(kq11)
+    vix_4w = pct_change_weeks(vix)
+
+    # 4) 금리·달러·원자재
+    t10 = fred("DGS10"); t02 = fred("DGS2")
+    dxy, dxy_label = get_dollar_index()
+    usdk = yf_series("KRW=X"); 
+    wti  = yf_series("CL=F"); 
+    gold = yf_series("GC=F"); 
+    # 백업 소스
+    if usdk.empty: usdk = fred("DEXKOUS").asfreq("B").ffill()
+    if wti.empty:  wti  = fred("DCOILWTICO")
+    if gold.empty: gold = fred("GOLDAMGBD228NLBM")
+
+    t10_c, t02_c = pct_change_weeks(t10), pct_change_weeks(t02)
+    dxy_c = pct_change_weeks(dxy)
+    usdk_c, wti_c, gold_c = pct_change_weeks(usdk), pct_change_weeks(wti), pct_change_weeks(gold)
+
+    def last(s): return s.dropna().iloc[-1] if isinstance(s, pd.Series) and not s.dropna().empty else np.nan
+
+    lines=[]
+    lines.append(f"[Market Monitor] {ts}\n")
+
+    lines.append("광범위 지표(200일선 상단 비율):")
+    lines.append(f"  · S&P500: { _pct(us_ratio) if us_ratio==us_ratio else 'N/A' } {_emoji_zone(us_ratio)}")
+    lines.append(f"  · KOSPI200: { _pct(kr_ratio) if kr_ratio==kr_ratio else 'N/A' } {_emoji_zone(kr_ratio)}\n")
+
+    lines.append("Equal vs Cap (4주 변화):")
+    lines.append(f"  · 미국 RSP/VOO: { _pct(rsp_voo_4w) if rsp_voo_4w==rsp_voo_4w else 'N/A' } {_emoji_zone(rsp_voo_4w, pos_is_hot=False)}")
+    lines.append(f"  · 한국 KODEX200 Equal Weight / KODEX200 (252000/069500): { _pct(kr_eqw_cap_4w) if kr_eqw_cap_4w==kr_eqw_cap_4w else 'N/A' } {_emoji_zone(kr_eqw_cap_4w, pos_is_hot=False)}\n")
+
+    lines.append("지수/변동성 (4주 변화):")
+    lines.append(f"  · KOSPI: { _pct(ks_4w) if ks_4w==ks_4w else 'N/A' } {_emoji_zone(ks_4w)}")
+    lines.append(f"  · KOSDAQ: { _pct(kq_4w) if kq_4w==kq_4w else 'N/A' } {_emoji_zone(kq_4w)}")
+    lines.append(f"  · VIX: { _pct(vix_4w) if vix_4w==vix_4w else 'N/A' } {_emoji_zone(-vix_4w)}\n")
+
+    lines.append("거시/경기 신호:")
+    sahm=fred("SAHMCURRENT"); t10y3m=fred("T10Y3M"); t10y2y=fred("T10Y2Y")
+    hy=fred("BAMLH0A0HYM2"); bbb=fred("BAMLC0A4CBBB")
+    lines.append(f"  · Sahm gap: { (f'{last(sahm):+.2f}pp') if last(sahm)==last(sahm) else 'N/A' }  (>= +0.50pp 시 침체 신호)")
+    lines.append(f"  · 장단기금리차 T10Y3M: { (f'{last(t10y3m):.2f}%') if last(t10y3m)==last(t10y3m) else 'N/A' }")
+    lines.append(f"  · 장단기금리차 T10Y2Y: { (f'{last(t10y2y):.2f}%') if last(t10y2y)==last(t10y2y) else 'N/A' }")
+    lines.append(f"  · HY OAS: { (f'{last(hy):.1f}bp') if last(hy)==last(hy) else 'N/A' }")
+    lines.append(f"  · BBB OAS: { (f'{last(bbb):.1f}bp') if last(bbb)==last(bbb) else 'N/A' }\n")
+
+    lines.append("금리·달러·원자재 (최근값, 4주 변화):")
+    lines.append(f"  · UST 10Y: { (f'{last(t10):.2f}%') if last(t10)==last(t10) else 'N/A' } ({ _pct(t10_c) if t10_c==t10_c else 'N/A' })")
+    lines.append(f"  · UST 2Y:  { (f'{last(t02):.2f}%') if last(t02)==last(t02) else 'N/A' } ({ _pct(t02_c) if t02_c==t02_c else 'N/A' })")
+    lines.append(f"  · {dxy_label}: { (f'{last(dxy):.2f}') if last(dxy)==last(dxy) else 'N/A' } ({ _pct(dxy_c) if dxy_c==dxy_c else 'N/A' })")
+    lines.append(f"  · USD/KRW: { (f'{last(usdk):.2f}') if last(usdk)==last(usdk) else 'N/A' } ({ _pct(usdk_c) if usdk_c==usdk_c else 'N/A' })")
+    lines.append(f"  · WTI(최근월): { (f'{last(wti):.2f}') if last(wti)==last(wti) else 'N/A' } ({ _pct(wti_c) if wti_c==wti_c else 'N/A' })")
+    lines.append(f"  · Gold(선물): { (f'{last(gold):.2f}') if last(gold)==last(gold) else 'N/A' } ({ _pct(gold_c) if gold_c==gold_c else 'N/A' })")
+
+    return "\n".join(lines)
+
+def send_notifications(_): pass
+def run_monitor(): return build_report(datetime.now(timezone.utc))
