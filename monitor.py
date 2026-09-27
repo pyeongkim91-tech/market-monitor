@@ -1,6 +1,6 @@
 # Market_Monitor_CLEAN.py
 # Drop-in replacement for monitor.py (Cloud Run / app.py와 호환)
-import os, logging
+import os, json, logging
 from io import StringIO
 from datetime import datetime, timezone, timedelta
 
@@ -62,7 +62,7 @@ def last(s: pd.Series):
 def pct_change_weeks(s: pd.Series, weeks=W4):
     s = s.dropna()
     if len(s) <= weeks: return np.nan
-    return s.iloc[-1] / s.iloc[-weeks] - 1.0
+    return s.iloc[-1] / s.iloc[-weeks-1] - 1.0
 
 def normalize_yield_pct(s: pd.Series):
     s = s.dropna()
@@ -314,6 +314,22 @@ def compute_market_temperature(signals: dict):
 
     return round(avg, 2), f"{state}", f"{posture} / {reliability}"
 
+# 주의: Cloud Run 파일시스템은 휘발성이라 인스턴스가 재시작되면 이력이 초기화됨
+def update_mti_history(new_value, filename="mti_log.json", max_len=3):
+    try:
+        hist = []
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                hist = json.load(f)
+        hist.append(new_value)
+        hist = hist[-max_len:]
+        with open(filename, "w") as f:
+            json.dump(hist, f)
+        return sum(hist) / len(hist)
+    except Exception as e:
+        logging.exception(f"MTI history update failed: {e}")
+        return np.nan
+
 # ---------------- 리포트 ----------------
 def build_report(now_utc: datetime):
     ts = now_utc.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
@@ -323,8 +339,8 @@ def build_report(now_utc: datetime):
     k2  = get_kospi200_tickers()
     us_b = breadth_last_series_batched(spx, start=START, sma_win=SMA_WIN, batch=80) if spx else pd.Series(dtype="float64")
     kr_b = breadth_last_series_batched(k2,  start=START, sma_win=SMA_WIN, batch=80) if k2  else pd.Series(dtype="float64")
-    us_ratio = (us_b.sum() / len(us_b)) if len(us_b)>0 else np.nan
-    kr_ratio = (kr_b.sum() / len(kr_b)) if len(kr_b)>0 else np.nan
+    us_ratio = us_b.mean() if us_b.notna().any() else np.nan
+    kr_ratio = kr_b.mean() if kr_b.notna().any() else np.nan
 
     # 2) Equal vs Cap (4주)
     rsp_voo = ratio_eqw_cap(US_EQW, US_CAP, START)
@@ -364,17 +380,29 @@ def build_report(now_utc: datetime):
     gold_c = pct_change_weeks(gold)
 
     # 출력
+    # 신호등 수집 (MTI 계산용 — 리포트에 표시되는 것과 동일한 값)
+    signals = {
+        "S&P500":   light_ratio(us_ratio),
+        "KOSPI200": light_ratio(kr_ratio),
+        "RSP/VOO":  light_change(rsp_voo_4w, good_when_positive=True),
+        "KR Equal": light_change(kr_eqw_cap_4w, good_when_positive=True),
+        "KOSPI":    light_change(ks_4w, True),
+        "KOSDAQ":   light_change(kq_4w, True),
+        "VIX":      light_change(vix_4w, good_when_positive=False),
+    }
+    mti, state, posture = compute_market_temperature(signals)
+    bars = int(round((mti + 1) * 5))
+
+    # 출력
     L=[]
-
-# MTI 계산 및 헤더 표시
-mti, state, posture = compute_market_temperature(signals)
-lines.append(f"Market Temperature: 🌡️ {'▓' * int((mti+1)*5)}{'░' * (10 - int((mti+1)*5))} {int((mti+1)*50)}/100")
-lines.append(f"상태: {state}")
-lines.append(f"포지셔닝: {posture}")
-lines.append("")  # 빈 줄로 구분
-
-
     L.append(f"[Market Monitor] {ts}\n")
+    L.append(f"Market Temperature: 🌡️ {'▓' * bars}{'░' * (10 - bars)} {int(round((mti+1)*50))}/100")
+    L.append(f"상태: {state}")
+    L.append(f"포지셔닝: {posture}")
+    mti_3d = update_mti_history(mti)
+    if mti_3d == mti_3d:
+        L.append(f"3회 평균 MTI: {mti_3d:+.2f}")
+    L.append("")
     L.append("광범위 지표(200일선 상단 비율):")
     L.append(f"  · S&P500: { _pct(us_ratio) if not np.isnan(us_ratio) else 'N/A' } {light_ratio(us_ratio)}")
     L.append(f"  · KOSPI200: { _pct(kr_ratio) if not np.isnan(kr_ratio) else 'N/A' } {light_ratio(kr_ratio)}\n")
@@ -395,8 +423,8 @@ lines.append("")  # 빈 줄로 구분
     L.append(f"  · Sahm gap: { (f'{last(sahm):+.2f}pp') if last(sahm)==last(sahm) else 'N/A' }  (>= +0.50pp 시 침체 신호)")
     L.append(f"  · 장단기금리차 T10Y3M: { (f'{last(t10y3m):.2f}%') if last(t10y3m)==last(t10y3m) else 'N/A' }")
     L.append(f"  · 장단기금리차 T10Y2Y: { (f'{last(t10y2y):.2f}%') if last(t10y2y)==last(t10y2y) else 'N/A' }")
-    L.append(f"  · HY OAS: { (f'{last(hy):.1f}bp') if last(hy)==last(hy) else 'N/A' }")
-    L.append(f"  · BBB OAS: { (f'{last(bbb):.1f}bp') if last(bbb)==last(bbb) else 'N/A' }\n")
+    L.append(f"  · HY OAS: { (f'{last(hy)*100:.0f}bp') if last(hy)==last(hy) else 'N/A' }")
+    L.append(f"  · BBB OAS: { (f'{last(bbb)*100:.0f}bp') if last(bbb)==last(bbb) else 'N/A' }\n")
 
     L.append("금리·달러·원자재 (최근값, 4주 변화):")
     L.append(f"  · UST 10Y: { (f'{last(t10):.2f}%') if last(t10)==last(t10) else 'N/A' } ({ _pct(t10_c) if t10_c==t10_c else 'N/A' })")
@@ -406,37 +434,7 @@ lines.append("")  # 빈 줄로 구분
     L.append(f"  · WTI(최근월): { (f'{last(wti):.2f}') if last(wti)==last(wti) else 'N/A' } ({ _pct(wti_c) if wti_c==wti_c else 'N/A' })")
     L.append(f"  · Gold(선물): { (f'{last(gold):.2f}') if last(gold)==last(gold) else 'N/A' } ({ _pct(gold_c) if gold_c==gold_c else 'N/A' })")
 
-# 🟢🟡🔴 결과를 수집 (기존 신호등 텍스트를 그대로 사용 가능)
-signals = {
-    "S&P500": "🟡",
-    "KOSPI200": "🟢",
-    "RSP/VOO": "🟡",
-    "KR Equal": "🟡",
-    "KOSPI": "🟢",
-    "KOSDAQ": "🟡",
-    "VIX": "🟢",
-    # 거시/금리/달러 등도 원하면 포함
-}
-
-
     return "\n".join(L).strip()
-
-import json, os
-
-def update_mti_history(new_value, filename="mti_log.json", max_len=3):
-    hist = []
-    if os.path.exists(filename):
-        with open(filename, "r") as f:
-            hist = json.load(f)
-    hist.append(new_value)
-    hist = hist[-max_len:]
-    with open(filename, "w") as f:
-        json.dump(hist, f)
-    return sum(hist) / len(hist)
-
-# build_report 안에서
-mti_3d = update_mti_history(mti)
-lines.append(f"3일 평균 MTI: {mti_3d:+.2f}")
 
 
 # ---------------- 알림/엔트리 ----------------
