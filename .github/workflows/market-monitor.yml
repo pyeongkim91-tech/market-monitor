@@ -1,0 +1,61 @@
+name: Market Monitor
+
+on:
+  schedule:
+    - cron: "50 22 * * 0-4"   # 평일(월~금) 07:50 KST
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: "텔레그램 발송"
+        type: boolean
+        default: true
+  push:
+    branches: ["claude/**"]    # 작업 브랜치 검증용 (발송 안 함)
+
+concurrency:
+  group: market-monitor-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Smoke test (mocked data)
+        run: python tests/smoke_test.py
+
+      - name: Restore MTI history
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: mti-${{ github.run_id }}
+          restore-keys: mti-
+
+      - name: Build report
+        env:
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MTI_HISTORY_PATH: .state/mti_log.json
+          NOTIFY: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.notify) }}
+        run: |
+          mkdir -p .state
+          python monitor.py
+
+      - name: Save MTI history
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: mti-${{ github.run_id }}

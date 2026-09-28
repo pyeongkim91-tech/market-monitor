@@ -1,4 +1,4 @@
-# monitor.py — Market Monitor 리포트 생성 (app.py / Cloud Run에서 import)
+# monitor.py — Market Monitor 리포트 생성 + 텔레그램 발송 (GitHub Actions에서 실행)
 import os, json, logging
 from io import StringIO
 from datetime import datetime, timezone, timedelta
@@ -23,7 +23,7 @@ KST     = timezone(timedelta(hours=9))
 US_EQW, US_CAP = "RSP", "VOO"
 KOSPI, KOSDAQ, VIX_TK = "^KS11", "^KQ11", "^VIX"
 
-# 한국 EW/Cap (정정 반영)
+# 한국 EW/Cap
 KR_EQW, KR_CAP = "252000.KS", "069500.KS"  # 252000 = TIGER 200 Equal Weighted / 069500 = KODEX200
 KR_EQW_NAME, KR_CAP_NAME = "TIGER 200 Equal Weighted", "KODEX200"
 
@@ -117,15 +117,7 @@ def yf_series(ticker:str, start=START) -> pd.Series:
         logging.exception(f"yf_series({ticker}) failed: {e}")
         return pd.Series(dtype="float64")
 
-# ---------------- 위키 티커 ----------------
-def _norm_kr_code(s: str) -> str:
-    if not isinstance(s,str): return s
-    s=s.strip()
-    if not s: return s
-    if s.upper().endswith((".KS",".KQ")): return s
-    if s.isdigit() and len(s)==6: return s + ".KS"
-    return s
-
+# ---------------- 구성종목 ----------------
 def get_sp500_tickers():
     urls = [
         "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
@@ -149,7 +141,7 @@ KOSPI200_MIN = 190  # 구성종목 수 품질 기준 (정원 200)
 
 def _kospi200_from_krx():
     """KRX 정보데이터시스템(pykrx)에서 KOSPI200(지수코드 1028) 구성종목.
-    로그인 정보는 환경변수 KRX_ID / KRX_PW 로 전달 (코드/저장소에 두지 않음)."""
+    pykrx가 환경변수 KRX_ID / KRX_PW 로 KRX에 로그인함."""
     try:
         from pykrx import stock
     except ImportError:
@@ -324,7 +316,7 @@ def compute_market_temperature(signals: dict):
     return round(avg, 2), f"{state}", f"{posture} / {reliability}"
 
 # MTI 이력: {날짜(KST): MTI}. 같은 날 여러 번 돌려도 하루 1개로 집계.
-# Cloud Run 로컬 디스크는 휘발성 → MTI_HISTORY_PATH를 GCS 볼륨 마운트 경로로 지정할 것.
+# GitHub Actions에서는 actions/cache로 MTI_HISTORY_PATH 파일을 실행 간에 이어받음.
 def update_mti_history(new_value, day: str, max_days=3):
     filename = os.environ.get("MTI_HISTORY_PATH", "mti_log.json")
     try:
@@ -453,42 +445,35 @@ def build_report(now_utc: datetime):
 
 
 # ---------------- 알림/엔트리 ----------------
-def send_notifications(text: str):
-    # 환경변수 기반 메일/텔레그램 (기존과 동일)
+def send_telegram(text: str) -> bool:
+    """TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 로 발송. 성공 여부 반환."""
+    bot = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not (bot and chat_id):
+        logging.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
+        return False
     try:
-        smtp_host = os.environ.get("SMTP_HOST")
-        smtp_port = int(os.environ.get("SMTP_PORT","587"))
-        smtp_user = os.environ.get("SMTP_USERNAME")
-        smtp_pass = os.environ.get("SMTP_PASSWORD")
-        email_from= os.environ.get("EMAIL_FROM")
-        to_list   = [x.strip() for x in os.environ.get("EMAIL_TO","").split(",") if x.strip()]
-        if smtp_host and smtp_user and smtp_pass and email_from and to_list:
-            import smtplib
-            from email.mime.text import MIMEText
-            subj_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
-            msg = MIMEText(text, _charset="utf-8")
-            msg["Subject"] = f"[Market Monitor] {subj_kst}"
-            msg["From"] = email_from
-            msg["To"]   = ", ".join(to_list)
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
-                s.starttls(); s.login(smtp_user, smtp_pass); s.sendmail(email_from, to_list, msg.as_string())
-    except Exception as e:
-        logging.exception(f"Email send failed: {e}")
+        r = _sess().post(f"https://api.telegram.org/bot{bot}/sendMessage",
+                         data={"chat_id": chat_id, "text": text[:4096]}, timeout=10)
+        if not r.ok:
+            # 응답 본문에 토큰이 들어가지 않으므로 그대로 기록
+            logging.error(f"Telegram send failed: {r.status_code} {r.text[:200]}")
+        return r.ok
+    except requests.RequestException as e:
+        logging.error(f"Telegram send failed: {type(e).__name__}")  # 예외 메시지엔 URL(토큰) 포함
+        return False
 
-    try:
-        bot = os.environ.get("TELEGRAM_BOT_TOKEN")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        if bot and chat_id:
-            url = f"https://api.telegram.org/bot{bot}/sendMessage"
-            _sess().post(url, data={"chat_id": chat_id, "text": text[:4096]}, timeout=10)
-    except Exception as e:
-        logging.exception(f"Telegram send failed: {e}")
-
-def run_monitor(notify: bool = True):
+def main() -> int:
     text = build_report(datetime.now(timezone.utc))
-    if notify:
-        send_notifications(text)
-    return text
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(f"```\n{text}\n```\n")
+    if os.environ.get("NOTIFY", "true").lower() == "false":
+        logging.info("NOTIFY=false; skipping Telegram")
+        return 0
+    return 0 if send_telegram(text) else 1
 
 if __name__ == "__main__":
-    print(run_monitor())
+    raise SystemExit(main())

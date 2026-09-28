@@ -1,7 +1,5 @@
-flask
-gunicorn
-yfinance
-pandas
+yfinance==1.7.0
+pandas==3.0.6
 numpy
 requests
 beautifulsoup4
