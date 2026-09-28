@@ -180,9 +180,11 @@ def get_kospi200_tickers():
     """KRX 우선, 실패 시 Wikipedia. 품질 기준 미달이면 빈 리스트 (틀린 값보다 N/A가 낫다)"""
     tickers = _kospi200_from_krx()
     if tickers:
+        logging.info(f"KOSPI200 constituents: {len(tickers)} from KRX")
         return tickers
     tickers = _kospi200_from_wiki()
     if len(tickers) >= KOSPI200_MIN:
+        logging.info(f"KOSPI200 constituents: {len(tickers)} from Wikipedia")
         return tickers
     logging.warning(f"KOSPI200 tickers insufficient ({len(tickers)}); breadth will be N/A")
     return []
@@ -263,17 +265,53 @@ def get_indices(start=START):
     return out
 
 # ---------------- 매크로(FRED) ----------------
-# pandas_datareader는 관리 중단 → FRED CSV 엔드포인트 직접 사용
-def fred(series_id, start=START):
-    try:
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-        df = pd.read_csv(StringIO(_http_get(url)))
-        s = pd.Series(pd.to_numeric(df.iloc[:, 1], errors="coerce").values,
-                      index=pd.to_datetime(df.iloc[:, 0]), name=series_id)
-        return s.dropna()
-    except Exception as e:
-        logging.exception(f"FRED fetch failed for {series_id}: {e}")
+# 공식 API(FRED_API_KEY) 우선. fredgraph.csv는 GitHub Actions에서 응답 없이 멈추는 경우가 있어
+# 키가 없을 때만 쓰고, 한 번 실패하면 이번 실행에서는 더 시도하지 않는다.
+FRED_TIMEOUT = 10
+_fred_csv_down = False
+
+def _to_series(dates, values, name):
+    s = pd.Series(pd.to_numeric(pd.Series(values), errors="coerce").values,
+                  index=pd.to_datetime(pd.Series(dates)), name=name)
+    return s.dropna()
+
+def _fred_api(series_id, start, key):
+    for _ in range(2):
+        try:
+            r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                             params={"series_id": series_id, "api_key": key,
+                                     "file_type": "json", "observation_start": start},
+                             timeout=FRED_TIMEOUT)
+            r.raise_for_status()
+            obs = r.json()["observations"]
+            return _to_series([o["date"] for o in obs], [o["value"] for o in obs], series_id)
+        except Exception as e:
+            # 예외 메시지에는 api_key가 든 URL이 포함되므로 타입만 기록
+            logging.warning(f"FRED API failed for {series_id}: {type(e).__name__}")
+    return pd.Series(dtype="float64")
+
+def _fred_csv(series_id, start):
+    global _fred_csv_down
+    if _fred_csv_down:
         return pd.Series(dtype="float64")
+    try:
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                         params={"id": series_id, "cosd": start}, timeout=FRED_TIMEOUT)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+        return _to_series(df.iloc[:, 0], df.iloc[:, 1], series_id)
+    except Exception as e:
+        _fred_csv_down = True
+        logging.warning(f"FRED CSV failed for {series_id} ({type(e).__name__}); skipping remaining CSV requests")
+        return pd.Series(dtype="float64")
+
+def fred(series_id, start=START):
+    key = os.environ.get("FRED_API_KEY")
+    if key:
+        s = _fred_api(series_id, start, key)
+        if not s.empty:
+            return s
+    return _fred_csv(series_id, start)
 
 # ---------------- 신호등 ----------------
 def light_ratio(x):

@@ -14,7 +14,7 @@
 | 시세·지수·환율·원자재 | Yahoo Finance (`yfinance`) |
 | S&P500 구성종목 | Wikipedia |
 | KOSPI200 구성종목 | KRX 정보데이터시스템 (`pykrx`), 실패 시 Wikipedia |
-| 금리·스프레드·Sahm | FRED CSV (`fredgraph.csv`) |
+| 금리·스프레드·Sahm | FRED 공식 API (`FRED_API_KEY`), 키가 없으면 `fredgraph.csv` |
 
 KOSPI200 구성종목을 190개 미만으로 받으면 KOSPI200 breadth는 `N/A`로 표시한다.
 틀린 종목 리스트로 계산하는 것보다 N/A가 낫다고 보기 때문이다.
@@ -26,6 +26,7 @@ KOSPI200 구성종목을 190개 미만으로 받으면 KOSPI200 breadth는 `N/A`
 | `TELEGRAM_BOT_TOKEN` | 텔레그램 봇 토큰 (@BotFather) |
 | `TELEGRAM_CHAT_ID` | 받을 채팅 ID |
 | `KRX_ID`, `KRX_PW` | KRX 정보데이터시스템 로그인 정보 (pykrx가 읽음) |
+| `FRED_API_KEY` | FRED API 키 (무료, fredaccount.stlouisfed.org). 없으면 거시·금리 지표가 N/A가 되기 쉬움 |
 
 ## 실행
 

@@ -44,3 +44,39 @@ s = pd.Series(np.arange(1.0, 31.0))
 assert abs(m.pct_change_weeks(s) - (30 / 10 - 1)) < 1e-12
 
 print("\nsmoke test OK")
+
+# FRED: API 응답 파싱('.'은 결측) + CSV 실패 시 이후 요청 건너뜀
+import importlib
+m = importlib.reload(m)
+
+
+class _Resp:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self.payload
+
+
+calls = []
+
+
+def fake_get(url, params=None, timeout=None):
+    calls.append(url)
+    if "api.stlouisfed.org" in url:
+        return _Resp({"observations": [{"date": "2026-01-02", "value": "3.10"},
+                                       {"date": "2026-01-05", "value": "."}]})
+    raise m.requests.ConnectTimeout("boom")
+
+
+m.requests.get = fake_get
+os.environ["FRED_API_KEY"] = "dummy"
+s = m.fred("BAMLH0A0HYM2")
+assert list(s.values) == [3.10], s
+del os.environ["FRED_API_KEY"]
+assert m.fred("DGS2").empty and m.fred("T10Y2Y").empty
+assert sum("fredgraph" in c for c in calls) == 1, "CSV는 첫 실패 후 재시도하지 않음"
+print("fred test OK")
