@@ -25,8 +25,8 @@ KOSPI200 구성종목을 190개 미만으로 받으면 KOSPI200 breadth는 `N/A`
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | 텔레그램 봇 토큰 (@BotFather) |
 | `TELEGRAM_CHAT_ID` | 받을 채팅 ID |
-| `KRX_ID`, `KRX_PW` | KRX 정보데이터시스템 로그인 정보 (pykrx가 읽음) |
-| `FRED_API_KEY` | FRED API 키 (무료, fredaccount.stlouisfed.org). 없으면 거시·금리 지표가 N/A가 되기 쉬움 |
+| `KRX_ID`, `KRX_PW` | KRX 정보데이터시스템 로그인 정보 (pykrx가 읽음). 없으면 KRX가 거부해 Wikipedia 목록으로 대체 |
+| `FRED_API_KEY` | 선택. FRED API 키 (무료, fredaccount.stlouisfed.org). 키가 없으면 `fredgraph.csv`를 쓰는데, 가끔 응답이 없어 거시·금리 지표가 N/A가 될 수 있음 |
 
 ## 실행
 
