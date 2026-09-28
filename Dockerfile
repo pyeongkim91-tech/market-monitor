@@ -1,20 +1,16 @@
 FROM python:3.11-slim
 
-# OS 패키지 (lxml/bs4 속도/빌드 안정)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc g++ libxml2 libxslt1.1 libxslt1-dev libxml2-dev tzdata \
-  && rm -rf /var/lib/apt/lists/*
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    MPLBACKEND=Agg \
     TZ=Asia/Seoul
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 COPY app.py monitor.py ./
 ENV PORT=8080
 EXPOSE 8080
-CMD ["python", "app.py"]
+# worker 1개(중복 실행 방지 락이 프로세스 단위), 리포트 생성이 길어서 gunicorn 타임아웃 해제.
+# 요청 제한시간은 Cloud Run 쪽 --timeout 으로 관리.
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 0 app:app

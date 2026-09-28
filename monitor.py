@@ -1,5 +1,4 @@
-# Market_Monitor_CLEAN.py
-# Drop-in replacement for monitor.py (Cloud Run / app.py와 호환)
+# monitor.py — Market Monitor 리포트 생성 (app.py / Cloud Run에서 import)
 import os, json, logging
 from io import StringIO
 from datetime import datetime, timezone, timedelta
@@ -7,14 +6,15 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from pandas_datareader import data as pdr
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ---------------- 기본설정 ----------------
-START   = "2019-01-01"
+# 200일 SMA + 4주 변화에 필요한 만큼만 받음 (영업일 200일 ≈ 달력 290일, 여유 포함)
+LOOKBACK_DAYS = 450
+START   = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 SMA_WIN = 200
 W4      = 20  # 4주(영업일) 근사
 KST     = timezone(timedelta(hours=9))
@@ -145,49 +145,55 @@ def get_sp500_tickers():
             logging.exception(f"S&P500 ticker fetch failed ({url}): {e}")
     return []
 
-def get_kospi200_tickers():
-    """KOSPI200 위키에서 모든 표를 훑어 코드 컬럼을 찾아 robust 추출"""
-    import re
+KOSPI200_MIN = 190  # 구성종목 수 품질 기준 (정원 200)
+
+def _kospi200_from_krx():
+    """KRX 정보데이터시스템(pykrx)에서 KOSPI200(지수코드 1028) 구성종목.
+    로그인 정보는 환경변수 KRX_ID / KRX_PW 로 전달 (코드/저장소에 두지 않음)."""
     try:
-        html = _http_get("https://en.wikipedia.org/wiki/KOSPI_200")
-        # 페이지 내 모든 테이블 파싱
-        tables = pd.read_html(StringIO(html))
-        candidates = []
-
-        for df in tables:
-            # 열 이름 정규화
-            cols = [str(c).strip() for c in df.columns]
-            df.columns = cols
-
-            # 코드/티커 후보 컬럼
-            for key in ["Code", "Ticker", "Symbol", "KRX code", "Stock code"]:
-                if key in df.columns:
-                    series = df[key].astype(str).str.strip()
-                    # 6자리 숫자만 추출
-                    codes = series[series.str.match(r"^\d{6}$", na=False)].tolist()
-                    if codes:
-                        candidates.extend(codes)
-
-        # 중복 제거
-        codes_unique = sorted(set(candidates))
-        # .KS 접미사 부여
-        tickers = [c + ".KS" for c in codes_unique]
-
-        # 품질 체크: 150개 이상이면 성공으로 간주
-        if len(tickers) >= 150:
-            return tickers
-
-        # 보수적 fallback: 표 안에 6자리 숫자 패턴을 전역 탐색
-        text_codes = sorted(set(re.findall(r"\b(\d{6})\b", html)))
-        tickers2 = [c + ".KS" for c in text_codes]
-        if len(tickers2) >= 150:
-            return tickers2
-
-        logging.warning(f"KOSPI200 tickers fallback insufficient: {len(tickers)} found")
-        return tickers  # 그래도 있으면 반환
-    except Exception as e:
-        logging.exception(f"KOSPI200 ticker robust fetch failed: {e}")
+        from pykrx import stock
+    except ImportError:
+        logging.warning("pykrx not installed; skipping KRX source")
         return []
+    today = datetime.now(KST)
+    # 휴장일/장 시작 전 대비: 최근 7일을 거슬러 올라가며 시도
+    for d in range(7):
+        day = (today - timedelta(days=d)).strftime("%Y%m%d")
+        try:
+            codes = stock.get_index_portfolio_deposit_file("1028", day)
+            codes = [c for c in codes if isinstance(c, str) and len(c) == 6 and c.isdigit()]
+            if len(codes) >= KOSPI200_MIN:
+                return [c + ".KS" for c in codes]
+        except Exception as e:
+            logging.warning(f"KRX KOSPI200 fetch failed for {day}: {e}")
+    return []
+
+def _kospi200_from_wiki():
+    """Wikipedia 표의 코드 컬럼에서만 추출 (페이지 전체 숫자 긁기 금지)"""
+    try:
+        tables = pd.read_html(StringIO(_http_get("https://en.wikipedia.org/wiki/KOSPI_200")))
+    except Exception as e:
+        logging.exception(f"KOSPI200 wiki fetch failed: {e}")
+        return []
+    codes = set()
+    for df in tables:
+        df.columns = [str(c).strip() for c in df.columns]
+        for key in ["Code", "Ticker", "Symbol", "KRX code", "Stock code"]:
+            if key in df.columns:
+                s = df[key].astype(str).str.strip().str.zfill(6)
+                codes.update(s[s.str.fullmatch(r"\d{6}", na=False)])
+    return [c + ".KS" for c in sorted(codes)]
+
+def get_kospi200_tickers():
+    """KRX 우선, 실패 시 Wikipedia. 품질 기준 미달이면 빈 리스트 (틀린 값보다 N/A가 낫다)"""
+    tickers = _kospi200_from_krx()
+    if tickers:
+        return tickers
+    tickers = _kospi200_from_wiki()
+    if len(tickers) >= KOSPI200_MIN:
+        return tickers
+    logging.warning(f"KOSPI200 tickers insufficient ({len(tickers)}); breadth will be N/A")
+    return []
 
 # ---------------- 브레드스 ----------------
 def _to_close_matrix(px, chunk):
@@ -265,11 +271,14 @@ def get_indices(start=START):
     return out
 
 # ---------------- 매크로(FRED) ----------------
+# pandas_datareader는 관리 중단 → FRED CSV 엔드포인트 직접 사용
 def fred(series_id, start=START):
     try:
-        s = pdr.DataReader(series_id, "fred", start=start)
-        if isinstance(s, pd.DataFrame) and s.shape[1]==1: s = s.iloc[:,0]
-        return s
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
+        df = pd.read_csv(StringIO(_http_get(url)))
+        s = pd.Series(pd.to_numeric(df.iloc[:, 1], errors="coerce").values,
+                      index=pd.to_datetime(df.iloc[:, 0]), name=series_id)
+        return s.dropna()
     except Exception as e:
         logging.exception(f"FRED fetch failed for {series_id}: {e}")
         return pd.Series(dtype="float64")
@@ -314,21 +323,27 @@ def compute_market_temperature(signals: dict):
 
     return round(avg, 2), f"{state}", f"{posture} / {reliability}"
 
-# 주의: Cloud Run 파일시스템은 휘발성이라 인스턴스가 재시작되면 이력이 초기화됨
-def update_mti_history(new_value, filename="mti_log.json", max_len=3):
+# MTI 이력: {날짜(KST): MTI}. 같은 날 여러 번 돌려도 하루 1개로 집계.
+# Cloud Run 로컬 디스크는 휘발성 → MTI_HISTORY_PATH를 GCS 볼륨 마운트 경로로 지정할 것.
+def update_mti_history(new_value, day: str, max_days=3):
+    filename = os.environ.get("MTI_HISTORY_PATH", "mti_log.json")
     try:
-        hist = []
+        hist = {}
         if os.path.exists(filename):
             with open(filename, "r") as f:
-                hist = json.load(f)
-        hist.append(new_value)
-        hist = hist[-max_len:]
-        with open(filename, "w") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):  # 구버전(list) 이력은 날짜가 없어 버림
+                hist = loaded
+        hist[day] = new_value
+        hist = dict(sorted(hist.items())[-max_days:])
+        tmp = filename + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(hist, f)
-        return sum(hist) / len(hist)
+        os.replace(tmp, filename)
+        return sum(hist.values()) / len(hist), len(hist)
     except Exception as e:
         logging.exception(f"MTI history update failed: {e}")
-        return np.nan
+        return np.nan, 0
 
 # ---------------- 리포트 ----------------
 def build_report(now_utc: datetime):
@@ -399,9 +414,9 @@ def build_report(now_utc: datetime):
     L.append(f"Market Temperature: 🌡️ {'▓' * bars}{'░' * (10 - bars)} {int(round((mti+1)*50))}/100")
     L.append(f"상태: {state}")
     L.append(f"포지셔닝: {posture}")
-    mti_3d = update_mti_history(mti)
-    if mti_3d == mti_3d:
-        L.append(f"3회 평균 MTI: {mti_3d:+.2f}")
+    mti_avg, n_days = update_mti_history(mti, now_utc.astimezone(KST).strftime("%Y-%m-%d"))
+    if n_days >= 2:
+        L.append(f"최근 {n_days}일 평균 MTI: {mti_avg:+.2f}")
     L.append("")
     L.append("광범위 지표(200일선 상단 비율):")
     L.append(f"  · S&P500: { _pct(us_ratio) if not np.isnan(us_ratio) else 'N/A' } {light_ratio(us_ratio)}")
@@ -469,9 +484,10 @@ def send_notifications(text: str):
     except Exception as e:
         logging.exception(f"Telegram send failed: {e}")
 
-def run_monitor():
+def run_monitor(notify: bool = True):
     text = build_report(datetime.now(timezone.utc))
-    send_notifications(text)
+    if notify:
+        send_notifications(text)
     return text
 
 if __name__ == "__main__":

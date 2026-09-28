@@ -3,4 +3,7 @@ __pycache__/
 .env
 .env.*
 .cache/
+.mm_cache/
+mti_log.json
+*.bak*
 .DS_Store
