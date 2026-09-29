@@ -1,20 +1,20 @@
-# Market_Monitor_CLEAN.py
-# Drop-in replacement for monitor.py (Cloud Run / app.py와 호환)
-import os, logging
+# monitor.py — Market Monitor 리포트 생성 + 텔레그램 발송 (GitHub Actions에서 실행)
+import os, json, logging
 from io import StringIO
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from pandas_datareader import data as pdr
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ---------------- 기본설정 ----------------
-START   = "2019-01-01"
+# 200일 SMA + 4주 변화에 필요한 만큼만 받음 (영업일 200일 ≈ 달력 290일, 여유 포함)
+LOOKBACK_DAYS = 450
+START   = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 SMA_WIN = 200
 W4      = 20  # 4주(영업일) 근사
 KST     = timezone(timedelta(hours=9))
@@ -23,7 +23,7 @@ KST     = timezone(timedelta(hours=9))
 US_EQW, US_CAP = "RSP", "VOO"
 KOSPI, KOSDAQ, VIX_TK = "^KS11", "^KQ11", "^VIX"
 
-# 한국 EW/Cap (정정 반영)
+# 한국 EW/Cap
 KR_EQW, KR_CAP = "252000.KS", "069500.KS"  # 252000 = TIGER 200 Equal Weighted / 069500 = KODEX200
 KR_EQW_NAME, KR_CAP_NAME = "TIGER 200 Equal Weighted", "KODEX200"
 
@@ -62,7 +62,7 @@ def last(s: pd.Series):
 def pct_change_weeks(s: pd.Series, weeks=W4):
     s = s.dropna()
     if len(s) <= weeks: return np.nan
-    return s.iloc[-1] / s.iloc[-weeks] - 1.0
+    return s.iloc[-1] / s.iloc[-weeks-1] - 1.0
 
 def normalize_yield_pct(s: pd.Series):
     s = s.dropna()
@@ -117,15 +117,7 @@ def yf_series(ticker:str, start=START) -> pd.Series:
         logging.exception(f"yf_series({ticker}) failed: {e}")
         return pd.Series(dtype="float64")
 
-# ---------------- 위키 티커 ----------------
-def _norm_kr_code(s: str) -> str:
-    if not isinstance(s,str): return s
-    s=s.strip()
-    if not s: return s
-    if s.upper().endswith((".KS",".KQ")): return s
-    if s.isdigit() and len(s)==6: return s + ".KS"
-    return s
-
+# ---------------- 구성종목 ----------------
 def get_sp500_tickers():
     urls = [
         "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
@@ -145,49 +137,57 @@ def get_sp500_tickers():
             logging.exception(f"S&P500 ticker fetch failed ({url}): {e}")
     return []
 
-def get_kospi200_tickers():
-    """KOSPI200 위키에서 모든 표를 훑어 코드 컬럼을 찾아 robust 추출"""
-    import re
+KOSPI200_MIN = 190  # 구성종목 수 품질 기준 (정원 200)
+
+def _kospi200_from_krx():
+    """KRX 정보데이터시스템(pykrx)에서 KOSPI200(지수코드 1028) 구성종목.
+    pykrx가 환경변수 KRX_ID / KRX_PW 로 KRX에 로그인함."""
     try:
-        html = _http_get("https://en.wikipedia.org/wiki/KOSPI_200")
-        # 페이지 내 모든 테이블 파싱
-        tables = pd.read_html(StringIO(html))
-        candidates = []
-
-        for df in tables:
-            # 열 이름 정규화
-            cols = [str(c).strip() for c in df.columns]
-            df.columns = cols
-
-            # 코드/티커 후보 컬럼
-            for key in ["Code", "Ticker", "Symbol", "KRX code", "Stock code"]:
-                if key in df.columns:
-                    series = df[key].astype(str).str.strip()
-                    # 6자리 숫자만 추출
-                    codes = series[series.str.match(r"^\d{6}$", na=False)].tolist()
-                    if codes:
-                        candidates.extend(codes)
-
-        # 중복 제거
-        codes_unique = sorted(set(candidates))
-        # .KS 접미사 부여
-        tickers = [c + ".KS" for c in codes_unique]
-
-        # 품질 체크: 150개 이상이면 성공으로 간주
-        if len(tickers) >= 150:
-            return tickers
-
-        # 보수적 fallback: 표 안에 6자리 숫자 패턴을 전역 탐색
-        text_codes = sorted(set(re.findall(r"\b(\d{6})\b", html)))
-        tickers2 = [c + ".KS" for c in text_codes]
-        if len(tickers2) >= 150:
-            return tickers2
-
-        logging.warning(f"KOSPI200 tickers fallback insufficient: {len(tickers)} found")
-        return tickers  # 그래도 있으면 반환
-    except Exception as e:
-        logging.exception(f"KOSPI200 ticker robust fetch failed: {e}")
+        from pykrx import stock
+    except ImportError:
+        logging.warning("pykrx not installed; skipping KRX source")
         return []
+    today = datetime.now(KST)
+    # 휴장일/장 시작 전 대비: 최근 7일을 거슬러 올라가며 시도
+    for d in range(7):
+        day = (today - timedelta(days=d)).strftime("%Y%m%d")
+        try:
+            codes = stock.get_index_portfolio_deposit_file("1028", day)
+            codes = [c for c in codes if isinstance(c, str) and len(c) == 6 and c.isdigit()]
+            if len(codes) >= KOSPI200_MIN:
+                return [c + ".KS" for c in codes]
+        except Exception as e:
+            logging.warning(f"KRX KOSPI200 fetch failed for {day}: {e}")
+    return []
+
+def _kospi200_from_wiki():
+    """Wikipedia 표의 코드 컬럼에서만 추출 (페이지 전체 숫자 긁기 금지)"""
+    try:
+        tables = pd.read_html(StringIO(_http_get("https://en.wikipedia.org/wiki/KOSPI_200")))
+    except Exception as e:
+        logging.exception(f"KOSPI200 wiki fetch failed: {e}")
+        return []
+    codes = set()
+    for df in tables:
+        df.columns = [str(c).strip() for c in df.columns]
+        for key in ["Code", "Ticker", "Symbol", "KRX code", "Stock code"]:
+            if key in df.columns:
+                s = df[key].astype(str).str.strip().str.zfill(6)
+                codes.update(s[s.str.fullmatch(r"\d{6}", na=False)])
+    return [c + ".KS" for c in sorted(codes)]
+
+def get_kospi200_tickers():
+    """KRX 우선, 실패 시 Wikipedia. 품질 기준 미달이면 빈 리스트 (틀린 값보다 N/A가 낫다)"""
+    tickers = _kospi200_from_krx()
+    if tickers:
+        logging.info(f"KOSPI200 constituents: {len(tickers)} from KRX")
+        return tickers
+    tickers = _kospi200_from_wiki()
+    if len(tickers) >= KOSPI200_MIN:
+        logging.info(f"KOSPI200 constituents: {len(tickers)} from Wikipedia")
+        return tickers
+    logging.warning(f"KOSPI200 tickers insufficient ({len(tickers)}); breadth will be N/A")
+    return []
 
 # ---------------- 브레드스 ----------------
 def _to_close_matrix(px, chunk):
@@ -265,14 +265,53 @@ def get_indices(start=START):
     return out
 
 # ---------------- 매크로(FRED) ----------------
-def fred(series_id, start=START):
-    try:
-        s = pdr.DataReader(series_id, "fred", start=start)
-        if isinstance(s, pd.DataFrame) and s.shape[1]==1: s = s.iloc[:,0]
-        return s
-    except Exception as e:
-        logging.exception(f"FRED fetch failed for {series_id}: {e}")
+# 공식 API(FRED_API_KEY) 우선. fredgraph.csv는 GitHub Actions에서 응답 없이 멈추는 경우가 있어
+# 키가 없을 때만 쓰고, 한 번 실패하면 이번 실행에서는 더 시도하지 않는다.
+FRED_TIMEOUT = 10
+_fred_csv_down = False
+
+def _to_series(dates, values, name):
+    s = pd.Series(pd.to_numeric(pd.Series(values), errors="coerce").values,
+                  index=pd.to_datetime(pd.Series(dates)), name=name)
+    return s.dropna()
+
+def _fred_api(series_id, start, key):
+    for _ in range(2):
+        try:
+            r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                             params={"series_id": series_id, "api_key": key,
+                                     "file_type": "json", "observation_start": start},
+                             timeout=FRED_TIMEOUT)
+            r.raise_for_status()
+            obs = r.json()["observations"]
+            return _to_series([o["date"] for o in obs], [o["value"] for o in obs], series_id)
+        except Exception as e:
+            # 예외 메시지에는 api_key가 든 URL이 포함되므로 타입만 기록
+            logging.warning(f"FRED API failed for {series_id}: {type(e).__name__}")
+    return pd.Series(dtype="float64")
+
+def _fred_csv(series_id, start):
+    global _fred_csv_down
+    if _fred_csv_down:
         return pd.Series(dtype="float64")
+    try:
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                         params={"id": series_id, "cosd": start}, timeout=FRED_TIMEOUT)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+        return _to_series(df.iloc[:, 0], df.iloc[:, 1], series_id)
+    except Exception as e:
+        _fred_csv_down = True
+        logging.warning(f"FRED CSV failed for {series_id} ({type(e).__name__}); skipping remaining CSV requests")
+        return pd.Series(dtype="float64")
+
+def fred(series_id, start=START):
+    key = os.environ.get("FRED_API_KEY")
+    if key:
+        s = _fred_api(series_id, start, key)
+        if not s.empty:
+            return s
+    return _fred_csv(series_id, start)
 
 # ---------------- 신호등 ----------------
 def light_ratio(x):
@@ -314,6 +353,28 @@ def compute_market_temperature(signals: dict):
 
     return round(avg, 2), f"{state}", f"{posture} / {reliability}"
 
+# MTI 이력: {날짜(KST): MTI}. 같은 날 여러 번 돌려도 하루 1개로 집계.
+# GitHub Actions에서는 actions/cache로 MTI_HISTORY_PATH 파일을 실행 간에 이어받음.
+def update_mti_history(new_value, day: str, max_days=3):
+    filename = os.environ.get("MTI_HISTORY_PATH", "mti_log.json")
+    try:
+        hist = {}
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):  # 구버전(list) 이력은 날짜가 없어 버림
+                hist = loaded
+        hist[day] = new_value
+        hist = dict(sorted(hist.items())[-max_days:])
+        tmp = filename + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(hist, f)
+        os.replace(tmp, filename)
+        return sum(hist.values()) / len(hist), len(hist)
+    except Exception as e:
+        logging.exception(f"MTI history update failed: {e}")
+        return np.nan, 0
+
 # ---------------- 리포트 ----------------
 def build_report(now_utc: datetime):
     ts = now_utc.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
@@ -323,8 +384,8 @@ def build_report(now_utc: datetime):
     k2  = get_kospi200_tickers()
     us_b = breadth_last_series_batched(spx, start=START, sma_win=SMA_WIN, batch=80) if spx else pd.Series(dtype="float64")
     kr_b = breadth_last_series_batched(k2,  start=START, sma_win=SMA_WIN, batch=80) if k2  else pd.Series(dtype="float64")
-    us_ratio = (us_b.sum() / len(us_b)) if len(us_b)>0 else np.nan
-    kr_ratio = (kr_b.sum() / len(kr_b)) if len(kr_b)>0 else np.nan
+    us_ratio = us_b.mean() if us_b.notna().any() else np.nan
+    kr_ratio = kr_b.mean() if kr_b.notna().any() else np.nan
 
     # 2) Equal vs Cap (4주)
     rsp_voo = ratio_eqw_cap(US_EQW, US_CAP, START)
@@ -364,17 +425,29 @@ def build_report(now_utc: datetime):
     gold_c = pct_change_weeks(gold)
 
     # 출력
+    # 신호등 수집 (MTI 계산용 — 리포트에 표시되는 것과 동일한 값)
+    signals = {
+        "S&P500":   light_ratio(us_ratio),
+        "KOSPI200": light_ratio(kr_ratio),
+        "RSP/VOO":  light_change(rsp_voo_4w, good_when_positive=True),
+        "KR Equal": light_change(kr_eqw_cap_4w, good_when_positive=True),
+        "KOSPI":    light_change(ks_4w, True),
+        "KOSDAQ":   light_change(kq_4w, True),
+        "VIX":      light_change(vix_4w, good_when_positive=False),
+    }
+    mti, state, posture = compute_market_temperature(signals)
+    bars = int(round((mti + 1) * 5))
+
+    # 출력
     L=[]
-
-# MTI 계산 및 헤더 표시
-mti, state, posture = compute_market_temperature(signals)
-lines.append(f"Market Temperature: 🌡️ {'▓' * int((mti+1)*5)}{'░' * (10 - int((mti+1)*5))} {int((mti+1)*50)}/100")
-lines.append(f"상태: {state}")
-lines.append(f"포지셔닝: {posture}")
-lines.append("")  # 빈 줄로 구분
-
-
     L.append(f"[Market Monitor] {ts}\n")
+    L.append(f"Market Temperature: 🌡️ {'▓' * bars}{'░' * (10 - bars)} {int(round((mti+1)*50))}/100")
+    L.append(f"상태: {state}")
+    L.append(f"포지셔닝: {posture}")
+    mti_avg, n_days = update_mti_history(mti, now_utc.astimezone(KST).strftime("%Y-%m-%d"))
+    if n_days >= 2:
+        L.append(f"최근 {n_days}일 평균 MTI: {mti_avg:+.2f}")
+    L.append("")
     L.append("광범위 지표(200일선 상단 비율):")
     L.append(f"  · S&P500: { _pct(us_ratio) if not np.isnan(us_ratio) else 'N/A' } {light_ratio(us_ratio)}")
     L.append(f"  · KOSPI200: { _pct(kr_ratio) if not np.isnan(kr_ratio) else 'N/A' } {light_ratio(kr_ratio)}\n")
@@ -395,8 +468,8 @@ lines.append("")  # 빈 줄로 구분
     L.append(f"  · Sahm gap: { (f'{last(sahm):+.2f}pp') if last(sahm)==last(sahm) else 'N/A' }  (>= +0.50pp 시 침체 신호)")
     L.append(f"  · 장단기금리차 T10Y3M: { (f'{last(t10y3m):.2f}%') if last(t10y3m)==last(t10y3m) else 'N/A' }")
     L.append(f"  · 장단기금리차 T10Y2Y: { (f'{last(t10y2y):.2f}%') if last(t10y2y)==last(t10y2y) else 'N/A' }")
-    L.append(f"  · HY OAS: { (f'{last(hy):.1f}bp') if last(hy)==last(hy) else 'N/A' }")
-    L.append(f"  · BBB OAS: { (f'{last(bbb):.1f}bp') if last(bbb)==last(bbb) else 'N/A' }\n")
+    L.append(f"  · HY OAS: { (f'{last(hy)*100:.0f}bp') if last(hy)==last(hy) else 'N/A' }")
+    L.append(f"  · BBB OAS: { (f'{last(bbb)*100:.0f}bp') if last(bbb)==last(bbb) else 'N/A' }\n")
 
     L.append("금리·달러·원자재 (최근값, 4주 변화):")
     L.append(f"  · UST 10Y: { (f'{last(t10):.2f}%') if last(t10)==last(t10) else 'N/A' } ({ _pct(t10_c) if t10_c==t10_c else 'N/A' })")
@@ -406,75 +479,39 @@ lines.append("")  # 빈 줄로 구분
     L.append(f"  · WTI(최근월): { (f'{last(wti):.2f}') if last(wti)==last(wti) else 'N/A' } ({ _pct(wti_c) if wti_c==wti_c else 'N/A' })")
     L.append(f"  · Gold(선물): { (f'{last(gold):.2f}') if last(gold)==last(gold) else 'N/A' } ({ _pct(gold_c) if gold_c==gold_c else 'N/A' })")
 
-# 🟢🟡🔴 결과를 수집 (기존 신호등 텍스트를 그대로 사용 가능)
-signals = {
-    "S&P500": "🟡",
-    "KOSPI200": "🟢",
-    "RSP/VOO": "🟡",
-    "KR Equal": "🟡",
-    "KOSPI": "🟢",
-    "KOSDAQ": "🟡",
-    "VIX": "🟢",
-    # 거시/금리/달러 등도 원하면 포함
-}
-
-
     return "\n".join(L).strip()
-
-import json, os
-
-def update_mti_history(new_value, filename="mti_log.json", max_len=3):
-    hist = []
-    if os.path.exists(filename):
-        with open(filename, "r") as f:
-            hist = json.load(f)
-    hist.append(new_value)
-    hist = hist[-max_len:]
-    with open(filename, "w") as f:
-        json.dump(hist, f)
-    return sum(hist) / len(hist)
-
-# build_report 안에서
-mti_3d = update_mti_history(mti)
-lines.append(f"3일 평균 MTI: {mti_3d:+.2f}")
 
 
 # ---------------- 알림/엔트리 ----------------
-def send_notifications(text: str):
-    # 환경변수 기반 메일/텔레그램 (기존과 동일)
+def send_telegram(text: str) -> bool:
+    """TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 로 발송. 성공 여부 반환."""
+    bot = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not (bot and chat_id):
+        logging.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
+        return False
     try:
-        smtp_host = os.environ.get("SMTP_HOST")
-        smtp_port = int(os.environ.get("SMTP_PORT","587"))
-        smtp_user = os.environ.get("SMTP_USERNAME")
-        smtp_pass = os.environ.get("SMTP_PASSWORD")
-        email_from= os.environ.get("EMAIL_FROM")
-        to_list   = [x.strip() for x in os.environ.get("EMAIL_TO","").split(",") if x.strip()]
-        if smtp_host and smtp_user and smtp_pass and email_from and to_list:
-            import smtplib
-            from email.mime.text import MIMEText
-            subj_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
-            msg = MIMEText(text, _charset="utf-8")
-            msg["Subject"] = f"[Market Monitor] {subj_kst}"
-            msg["From"] = email_from
-            msg["To"]   = ", ".join(to_list)
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
-                s.starttls(); s.login(smtp_user, smtp_pass); s.sendmail(email_from, to_list, msg.as_string())
-    except Exception as e:
-        logging.exception(f"Email send failed: {e}")
+        r = _sess().post(f"https://api.telegram.org/bot{bot}/sendMessage",
+                         data={"chat_id": chat_id, "text": text[:4096]}, timeout=10)
+        if not r.ok:
+            # 응답 본문에 토큰이 들어가지 않으므로 그대로 기록
+            logging.error(f"Telegram send failed: {r.status_code} {r.text[:200]}")
+        return r.ok
+    except requests.RequestException as e:
+        logging.error(f"Telegram send failed: {type(e).__name__}")  # 예외 메시지엔 URL(토큰) 포함
+        return False
 
-    try:
-        bot = os.environ.get("TELEGRAM_BOT_TOKEN")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        if bot and chat_id:
-            url = f"https://api.telegram.org/bot{bot}/sendMessage"
-            _sess().post(url, data={"chat_id": chat_id, "text": text[:4096]}, timeout=10)
-    except Exception as e:
-        logging.exception(f"Telegram send failed: {e}")
-
-def run_monitor():
+def main() -> int:
     text = build_report(datetime.now(timezone.utc))
-    send_notifications(text)
-    return text
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(f"```\n{text}\n```\n")
+    if os.environ.get("NOTIFY", "true").lower() == "false":
+        logging.info("NOTIFY=false; skipping Telegram")
+        return 0
+    return 0 if send_telegram(text) else 1
 
 if __name__ == "__main__":
-    print(run_monitor())
+    raise SystemExit(main())
