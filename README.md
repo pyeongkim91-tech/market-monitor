@@ -1,5 +1,7 @@
 # Market Monitor
 
+> **기능 동결 공지 (2026-10-02):** 이 저장소의 기능은 phase1(`market-monitor-phase1`)로 흡수되는 동안 동결됩니다. D4 3일 병렬 대조가 끝날 때까지 삭제·아카이브하지 않습니다.
+
 미국·한국 시장 breadth, Equal/Cap 비율, 지수·VIX, 거시·금리 지표를 모아 신호등 리포트와
 시장온도(MTI)를 만들고 텔레그램으로 보낸다. GitHub Actions에서 평일 07:50 KST에 실행된다.
 
