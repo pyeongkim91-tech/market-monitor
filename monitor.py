@@ -64,6 +64,20 @@ def pct_change_weeks(s: pd.Series, weeks=W4):
     if len(s) <= weeks: return np.nan
     return s.iloc[-1] / s.iloc[-weeks-1] - 1.0
 
+def change_bp_weeks(s: pd.Series, weeks=W4):
+    """금리(%)의 4주 변화를 bp로. 금리 수준의 % 변화는 의미가 약하다."""
+    s = s.dropna()
+    if len(s) <= weeks: return np.nan
+    return (s.iloc[-1] - s.iloc[-weeks-1]) * 100
+
+def asof(s: pd.Series, fmt="%m/%d") -> str:
+    s = s.dropna() if s is not None else s
+    return f" [{s.index[-1]:{fmt}}]" if s is not None and not s.empty else ""
+
+def to_100(mti: float) -> int:
+    """MTI(-1~+1)를 0~100 점수로."""
+    return int(round((mti + 1) * 50))
+
 def normalize_yield_pct(s: pd.Series):
     s = s.dropna()
     if s.empty: return s
@@ -108,11 +122,32 @@ def pick_close(df, tk:str):
         logging.exception(f"pick_close failed for {tk}: {e}")
         return pd.Series(dtype="float64")
 
+# 한국장(09:00~15:30 KST)이 끝나기 전에 실행되면 yfinance는 오늘 날짜로 장중 가격을 준다.
+# 실행 시각에 따라 신호가 흔들리지 않도록, 마감 데이터가 확정되기 전에는 오늘 봉을 버린다.
+KR_SETTLED = (15, 40)  # (시, 분) KST
+
+def _now_kst() -> datetime:
+    return datetime.now(KST)
+
+def _is_kr(tk: str) -> bool:
+    return tk in (KOSPI, KOSDAQ) or tk.upper().endswith((".KS", ".KQ"))
+
+def drop_partial_kr_bar(obj):
+    """Series/DataFrame에서 아직 마감되지 않은 오늘(KST) 봉을 제거."""
+    now = _now_kst()
+    if obj is None or len(obj) == 0 or (now.hour, now.minute) >= KR_SETTLED:
+        return obj
+    idx = pd.DatetimeIndex(obj.index)
+    if idx.tz is not None:
+        idx = idx.tz_convert("Asia/Seoul").tz_localize(None)
+    return obj[idx.normalize() < pd.Timestamp(now.date())]
+
 def yf_series(ticker:str, start=START) -> pd.Series:
     try:
         df = yf.download(ticker, start=start, progress=False, group_by="ticker",
                          threads=False, auto_adjust=False)
-        return pick_close(df, ticker)
+        s = pick_close(df, ticker)
+        return drop_partial_kr_bar(s) if _is_kr(ticker) else s
     except Exception as e:
         logging.exception(f"yf_series({ticker}) failed: {e}")
         return pd.Series(dtype="float64")
@@ -225,6 +260,8 @@ def breadth_last_series_batched(tickers, start=START, sma_win=SMA_WIN, batch=80)
             logging.exception(f"yfinance download failed chunk[{i}:{i+batch}]: {e}")
             continue
         close = _to_close_matrix(px, chunk)
+        if close is not None and any(_is_kr(t) for t in chunk):
+            close = drop_partial_kr_bar(close)
         if close is None or close.empty: continue
 
         sma = close.rolling(sma_win, min_periods=max(10, sma_win//2)).mean()
@@ -244,6 +281,8 @@ def ratio_eqw_cap(eqw, cap, start=START):
         df = yf.download([eqw, cap], start=start, progress=False, group_by="ticker",
                          threads=False, auto_adjust=False)
         s_eqw, s_cap = pick_close(df, eqw), pick_close(df, cap)
+        if _is_kr(eqw) or _is_kr(cap):
+            s_eqw, s_cap = drop_partial_kr_bar(s_eqw), drop_partial_kr_bar(s_cap)
         if s_eqw.empty or s_cap.empty: return pd.Series(dtype="float64")
         return (s_eqw / s_cap).dropna()
     except Exception as e:
@@ -261,7 +300,8 @@ def get_indices(start=START):
         logging.exception(f"index download failed: {e}")
         px=None
     for tk in [KOSPI,KOSDAQ,VIX_TK,US_EQW,US_CAP]:
-        out[tk] = pick_close(px, tk) if px is not None else pd.Series(dtype="float64")
+        s = pick_close(px, tk) if px is not None else pd.Series(dtype="float64")
+        out[tk] = drop_partial_kr_bar(s) if _is_kr(tk) else s
     return out
 
 # ---------------- 매크로(FRED) ----------------
@@ -417,8 +457,8 @@ def build_report(now_utc: datetime):
     gold = yf_series("GC=F")
     if gold.empty: gold = yf_series("GLD")  # ETF 대체
 
-    t10_c  = pct_change_weeks(t10)
-    t02_c  = pct_change_weeks(t02)
+    t10_c  = change_bp_weeks(t10)
+    t02_c  = change_bp_weeks(t02)
     dxy_c  = pct_change_weeks(dxy)
     usdk_c = pct_change_weeks(usdk)
     wti_c  = pct_change_weeks(wti)
@@ -440,13 +480,15 @@ def build_report(now_utc: datetime):
 
     # 출력
     L=[]
-    L.append(f"[Market Monitor] {ts}\n")
-    L.append(f"Market Temperature: 🌡️ {'▓' * bars}{'░' * (10 - bars)} {int(round((mti+1)*50))}/100")
+    voo = idx.get(US_CAP)
+    L.append(f"[Market Monitor] {ts}")
+    L.append(f"기준: 미국{asof(voo)} 종가 · 한국{asof(ks11)} 종가\n")
+    L.append(f"Market Temperature: 🌡️ {'▓' * bars}{'░' * (10 - bars)} {to_100(mti)}/100")
     L.append(f"상태: {state}")
     L.append(f"포지셔닝: {posture}")
     mti_avg, n_days = update_mti_history(mti, now_utc.astimezone(KST).strftime("%Y-%m-%d"))
     if n_days >= 2:
-        L.append(f"최근 {n_days}일 평균 MTI: {mti_avg:+.2f}")
+        L.append(f"최근 {n_days}일 평균: {to_100(mti_avg)}/100")
     L.append("")
     L.append("광범위 지표(200일선 상단 비율):")
     L.append(f"  · S&P500: { _pct(us_ratio) if not np.isnan(us_ratio) else 'N/A' } {light_ratio(us_ratio)}")
@@ -465,19 +507,19 @@ def build_report(now_utc: datetime):
     L.append("거시/경기 신호:")
     sahm = fred("SAHMCURRENT"); t10y3m = fred("T10Y3M"); t10y2y = fred("T10Y2Y")
     hy   = fred("BAMLH0A0HYM2"); bbb    = fred("BAMLC0A4CBBB")
-    L.append(f"  · Sahm gap: { (f'{last(sahm):+.2f}pp') if last(sahm)==last(sahm) else 'N/A' }  (>= +0.50pp 시 침체 신호)")
-    L.append(f"  · 장단기금리차 T10Y3M: { (f'{last(t10y3m):.2f}%') if last(t10y3m)==last(t10y3m) else 'N/A' }")
-    L.append(f"  · 장단기금리차 T10Y2Y: { (f'{last(t10y2y):.2f}%') if last(t10y2y)==last(t10y2y) else 'N/A' }")
-    L.append(f"  · HY OAS: { (f'{last(hy)*100:.0f}bp') if last(hy)==last(hy) else 'N/A' }")
-    L.append(f"  · BBB OAS: { (f'{last(bbb)*100:.0f}bp') if last(bbb)==last(bbb) else 'N/A' }\n")
+    L.append(f"  · Sahm gap: { (f'{last(sahm):+.2f}pp') if last(sahm)==last(sahm) else 'N/A' }{asof(sahm, '%Y-%m')}  (>= +0.50pp 시 침체 신호)")
+    L.append(f"  · 장단기금리차 T10Y3M: { (f'{last(t10y3m):.2f}%') if last(t10y3m)==last(t10y3m) else 'N/A' }{asof(t10y3m)}")
+    L.append(f"  · 장단기금리차 T10Y2Y: { (f'{last(t10y2y):.2f}%') if last(t10y2y)==last(t10y2y) else 'N/A' }{asof(t10y2y)}")
+    L.append(f"  · HY OAS: { (f'{last(hy)*100:.0f}bp') if last(hy)==last(hy) else 'N/A' }{asof(hy)}")
+    L.append(f"  · BBB OAS: { (f'{last(bbb)*100:.0f}bp') if last(bbb)==last(bbb) else 'N/A' }{asof(bbb)}\n")
 
     L.append("금리·달러·원자재 (최근값, 4주 변화):")
-    L.append(f"  · UST 10Y: { (f'{last(t10):.2f}%') if last(t10)==last(t10) else 'N/A' } ({ _pct(t10_c) if t10_c==t10_c else 'N/A' })")
-    L.append(f"  · UST 2Y:  { (f'{last(t02):.2f}%') if last(t02)==last(t02) else 'N/A' } ({ _pct(t02_c) if t02_c==t02_c else 'N/A' })")
-    L.append(f"  · {dxy_label}: { (f'{last(dxy):.2f}') if last(dxy)==last(dxy) else 'N/A' } ({ _pct(dxy_c) if dxy_c==dxy_c else 'N/A' })")
-    L.append(f"  · USD/KRW: { (f'{last(usdk):.2f}') if last(usdk)==last(usdk) else 'N/A' } ({ _pct(usdk_c) if usdk_c==usdk_c else 'N/A' })")
-    L.append(f"  · WTI(최근월): { (f'{last(wti):.2f}') if last(wti)==last(wti) else 'N/A' } ({ _pct(wti_c) if wti_c==wti_c else 'N/A' })")
-    L.append(f"  · Gold(선물): { (f'{last(gold):.2f}') if last(gold)==last(gold) else 'N/A' } ({ _pct(gold_c) if gold_c==gold_c else 'N/A' })")
+    L.append(f"  · UST 10Y: { (f'{last(t10):.2f}%') if last(t10)==last(t10) else 'N/A' } ({ f'{t10_c:+.0f}bp' if t10_c==t10_c else 'N/A' }){asof(t10)}")
+    L.append(f"  · UST 2Y:  { (f'{last(t02):.2f}%') if last(t02)==last(t02) else 'N/A' } ({ f'{t02_c:+.0f}bp' if t02_c==t02_c else 'N/A' }){asof(t02)}")
+    L.append(f"  · {dxy_label}: { (f'{last(dxy):.2f}') if last(dxy)==last(dxy) else 'N/A' } ({ _pct(dxy_c) if dxy_c==dxy_c else 'N/A' }){asof(dxy)}")
+    L.append(f"  · USD/KRW: { (f'{last(usdk):.2f}') if last(usdk)==last(usdk) else 'N/A' } ({ _pct(usdk_c) if usdk_c==usdk_c else 'N/A' }){asof(usdk)}")
+    L.append(f"  · WTI(최근월): { (f'{last(wti):.2f}') if last(wti)==last(wti) else 'N/A' } ({ _pct(wti_c) if wti_c==wti_c else 'N/A' }){asof(wti)}")
+    L.append(f"  · Gold(선물): { (f'{last(gold):.2f}') if last(gold)==last(gold) else 'N/A' } ({ _pct(gold_c) if gold_c==gold_c else 'N/A' }){asof(gold)}")
 
     return "\n".join(L).strip()
 

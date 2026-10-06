@@ -33,6 +33,14 @@ jobs:
       - name: Smoke test (mocked data)
         run: python tests/smoke_test.py
 
+      - name: Data audit (validation pushes only)
+        if: github.event_name == 'push'
+        env:
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python tests/data_audit.py
+
       - name: Restore MTI history
         if: github.ref == 'refs/heads/main'
         uses: actions/cache/restore@v4
